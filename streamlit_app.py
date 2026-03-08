@@ -253,6 +253,24 @@ def _inject_styles() -> None:
                 box-shadow: 0 10px 18px rgba(11, 99, 246, 0.32);
             }
 
+            section[data-testid="stSidebar"] .stButton > button {
+                background: #1d4ed8 !important;
+                color: white !important;
+                font-weight: 800 !important;
+                border: 1px solid #1e40af !important;
+                box-shadow: 0 8px 16px rgba(29, 78, 216, 0.32) !important;
+            }
+
+            section[data-testid="stSidebar"] .stButton > button span,
+            section[data-testid="stSidebar"] .stButton > button p,
+            section[data-testid="stSidebar"] .stButton > button div {
+                color: #ffffff !important;
+            }
+
+            section[data-testid="stSidebar"] .stButton > button:hover {
+                background: #1e40af !important;
+            }
+
             div[data-baseweb="input"] input,
             div[data-baseweb="textarea"] textarea {
                 color: #000 !important;
