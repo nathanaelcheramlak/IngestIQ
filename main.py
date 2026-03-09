@@ -5,10 +5,13 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from google import genai
+import httpx
 import inngest
 import inngest.fast_api
+from pydantic import BaseModel
 
 from custom_types import ChunkAndSrc, QueryResult, SearchResult, UpsertResult
 from data_loader import embed_text, load_and_chunk_pdf
@@ -29,6 +32,10 @@ inngest_client = inngest.Inngest(
     serializer=inngest.PydanticSerializer(),
 )
 
+
+UPLOADS_DIR = Path("uploads")
+
+
 def _required_str(data: dict, key: str) -> str:
     value = data.get(key)
     if value is None:
@@ -39,6 +46,68 @@ def _required_str(data: dict, key: str) -> str:
     if not value:
         raise ValueError(f"Field '{key}' cannot be empty.")
     return value
+
+
+def _raise_service_unavailable(exc: Exception, operation: str) -> None:
+    if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException)):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"{operation} unavailable: cannot reach external AI service. "
+                "Check internet/DNS and retry."
+            ),
+        ) from exc
+    raise HTTPException(status_code=500, detail=f"{operation} failed: {exc}") from exc
+
+
+def _ingest_pdf_from_path(pdf_path: Path, source_id: str) -> UpsertResult:
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+
+    chunks = load_and_chunk_pdf(str(pdf_path))
+    if not chunks:
+        raise ValueError(f"No readable text content found in: {pdf_path}")
+
+    return _upsert_chunks(chunks, source_id or pdf_path.name)
+
+
+def _upsert_chunks(chunks: list[str], source_id: str) -> UpsertResult:
+    vecs = embed_text(chunks)
+    if len(vecs) != len(chunks):
+        raise RuntimeError("Embedding output length does not match chunk length.")
+
+    source = source_id or "unknown-source"
+    ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}:{i}")) for i in range(len(chunks))]
+    payloads = [{"source": source, "text": chunks[i]} for i in range(len(chunks))]
+    QdrantStorage().upsert(ids, vecs, payloads)
+    return UpsertResult(ingested=len(chunks))
+
+
+def _query_answer(question: str, top_k: int) -> QueryResult:
+    query_vec = embed_text([question])[0]
+    found = QdrantStorage().search(query_vec, top_k)
+    contexts = found["contexts"]
+    sources = found["sources"]
+
+    context_block = "\n\n".join(f"- {c}" for c in contexts)
+    prompt = (
+        "Use the following context to answer the question.\n\n"
+        f"Context:\n{context_block}\n\n"
+        f"Question: {question}\n"
+        "Answer concisely using only the context above."
+    )
+
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config={"temperature": 0.2, "max_output_tokens": 1024},
+    )
+
+    return QueryResult(
+        answer=(response.text or "").strip(),
+        sources=sources,
+        num_contexts=len(contexts),
+    )
 
 
 @inngest_client.create_function(
@@ -63,17 +132,8 @@ async def ingest_pdf(ctx: inngest.Context):
 
     # Step 2
     def _upsert(chunks_and_src: ChunkAndSrc) -> UpsertResult:
-        chunks = chunks_and_src.chunks
         source_id = chunks_and_src.source_id or "unknown-source"
-        vecs = embed_text(chunks)
-        if len(vecs) != len(chunks):
-            raise RuntimeError("Embedding output length does not match chunk length.")
-
-        ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source_id}:{i}")) for i in range(len(chunks))]
-        payloads = [{"source": source_id, "text": chunks[i]} for i in range(len(chunks))]
-
-        QdrantStorage().upsert(ids, vecs, payloads)
-        return UpsertResult(ingested=len(chunks))
+        return _upsert_chunks(chunks_and_src.chunks, source_id)
 
     chunks_and_src = await ctx.step.run("load-and-chunk", lambda: _load(ctx), output_type=ChunkAndSrc)
     ingested = await ctx.step.run("embed-and-upsert", lambda: _upsert(chunks_and_src), output_type=UpsertResult)
@@ -135,7 +195,75 @@ async def query_pdf(ctx: inngest.Context):
 
 
 app = FastAPI()
+
+frontend_origins_raw = os.getenv(
+    "FRONTEND_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173",
+)
+frontend_origins = [o.strip() for o in frontend_origins_raw.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=frontend_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 inngest.fast_api.serve(app, inngest_client, [ingest_pdf, query_pdf])
+
+
+class ChatRequest(BaseModel):
+    question: str
+    top_k: int = 5
+
+
+@app.post("/api/upload-pdf")
+async def upload_pdf(
+    file: UploadFile = File(...),
+    source_id: str | None = Form(default=None),
+) -> dict[str, str | int]:
+    filename = Path(file.filename or "document.pdf").name
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    try:
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        stored_name = f"{int(datetime.datetime.now(datetime.UTC).timestamp())}-{filename}"
+        destination = (UPLOADS_DIR / stored_name).resolve()
+        destination.write_bytes(await file.read())
+
+        final_source_id = (source_id or "").strip() or filename
+        result = _ingest_pdf_from_path(destination, final_source_id)
+        return {
+            "source_id": final_source_id,
+            "ingested": result.ingested,
+            "file_path": str(destination),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to upload/ingest PDF")
+        _raise_service_unavailable(exc, "PDF ingestion")
+
+
+@app.post("/api/chat")
+async def chat(request: ChatRequest) -> dict[str, str | int | list[str]]:
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question cannot be empty")
+
+    top_k = max(1, min(int(request.top_k), 20))
+    try:
+        result = _query_answer(question, top_k)
+        return {
+            "answer": result.answer,
+            "sources": result.sources,
+            "num_contexts": result.num_contexts,
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+        }
+    except Exception as exc:
+        logger.exception("Chat query failed")
+        _raise_service_unavailable(exc, "Chat query")
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
