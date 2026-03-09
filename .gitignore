@@ -11,3 +11,7 @@ uploads
 # Virtual environments
 .venv
 .env
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend
